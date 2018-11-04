@@ -1,4 +1,4 @@
-# BUIDL Bootcamp
+# BUIDL Bootcamp November, 2018
 
 ### Step 1: Git
 
