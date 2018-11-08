@@ -67,7 +67,7 @@ class Bank:
         transfer = Transfer(
             signature=None,
             public_key=public_key,
-    )
+        )
 
         # Create and return the coin with just the issuing transfer
         coin = BankCoin(transfers=[transfer])
@@ -76,6 +76,19 @@ class Bank:
         self.coins[coin.id] = deepcopy(coin)
 
         return coin
+
+    def observe_coin(self, coin):
+        last_observation = self.coins[coin.id]
+
+        last_observation_num_transfers = len(last_observation.transfers)
+        assert last_observation.transfers == \
+               coin.transfers[:last_observation_num_transfers]
+
+        coin.validate()
+
+        self.coins[coin.id] = deepcopy(coin)
+        return coin
+
 
     def fetch_coins(self, public_key):
         coins = []
