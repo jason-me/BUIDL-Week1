@@ -23,6 +23,10 @@ class TxIn:
         self.signature = signature
 
     @property
+    def outpoint(self):
+        return (self.tx_id, self.index)
+
+    @property
     def spend_message(self):
         return f"{self.tx_id}:{self.index}".encode()
 
@@ -33,6 +37,10 @@ class TxOut:
         self.index = index
         self.amount = amount
         self.public_key = public_key
+
+    @property
+    def outpoint(self):
+        return (self.tx_id, self.index)
 
 class Bank:
 
