@@ -95,7 +95,6 @@ class Bank:
             # Verify signature using public key of TxOut we're spending
             public_key = tx_out.public_key
             tx.verify_input(index, public_key)
-            public_key.verify(tx_in.signature, tx_in.spend_message)
 
             # Sum up the total inputs
             amount = tx_out.amount
