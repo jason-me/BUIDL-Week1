@@ -1,7 +1,22 @@
-import uuid
+"""
+BankNetCoin
+
+Usage:
+  banknetcoin.py serve
+  banknetcoin.py ping
+  banknetcoin.py balance <name>
+  banknetcoin.py tx <from> <to> <amount>
+
+Options:
+  -h --help     Show this screen.
+"""
+import uuid, socketserver, socket, sys
 from copy import deepcopy
 from ecdsa import SigningKey, SECP256k1
-from utils import serialize
+from utils import serialize, deserialize, prepare_simple_tx
+from docopt import docopt
+
+from identities import user_private_key, user_public_key
 
 
 def spend_message(tx, index):
@@ -98,10 +113,118 @@ class Bank:
 
     def fetch_utxo(self, public_key):
         return [utxo for utxo in self.utxo.values()
-                if utxo.public_key.to_string() == public_key.to_string()]
+                if utxo.public_key == public_key]
 
     def fetch_balance(self, public_key):
         # Fetch utxo associated with this public key
         unspents = self.fetch_utxo(public_key)
         # Sum the amounts
         return sum([tx_out.amount for tx_out in unspents])
+
+def prepare_message(command, data):
+    return {
+        "command": command,
+        "data": data,
+    }
+
+host = "0.0.0.0"
+port = 10000
+address = (host, port)
+bank = Bank()
+from identities import user_public_key
+
+class MyTCPServer(socketserver.TCPServer):
+    allow_reuse_address = True
+
+class TCPHandler(socketserver.BaseRequestHandler):
+
+    def respond(self, command, data):
+        response = prepare_message(command, data)
+        serialized_response = serialize(response)
+        self.request.sendall(serialized_response)
+
+    def handle(self):
+        message_data = self.request.recv(5000).strip()
+        message = deserialize(message_data)
+        command = message["command"]
+
+        print(f"got a message: {message}")
+
+        if command == "ping":
+            self.respond("pong", "")
+
+        if command == "balance":
+            public_key = message["data"]
+            balance = bank.fetch_balance(public_key)
+            self.respond("balance-response", balance)
+
+        if command == "utxo":
+            public_key = message["data"]
+            utxo = bank.fetch_utxo(public_key)
+            self.respond("utxo-response", utxo)
+
+        if command == "tx":
+            tx = message["data"]
+            try:
+                bank.handle_tx(tx)
+                self.respond("tx-response", data="accepted")
+            except:
+                self.respond("tx-response", data="rejected")
+
+
+def serve():
+    server = MyTCPServer(address, TCPHandler)
+    server.serve_forever()
+
+def send_message(command, data):
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.connect(address)
+
+    message = prepare_message(command, data)
+    serialized_message = serialize(message)
+    sock.sendall(serialized_message)
+
+    message_data = sock.recv(5000)
+    message = deserialize(message_data)
+
+    print(f"Received {message}")
+
+    return message
+
+def main(args):
+    if args["serve"]:
+        # HACK!
+        alice_public_key = user_public_key("alice")
+        bank.issue(1000, alice_public_key)
+        serve()
+    elif args["ping"]:
+        send_message("ping", "")
+    elif args["balance"]:
+        name = args["<name>"]
+        public_key = user_public_key(name)
+        send_message("balance", public_key)
+    elif args['tx']:
+        # banknetcoin.py tx <from> <to> <amount>
+        sender_private_key = user_private_key(args["<from>"])
+        sender_public_key = sender_private_key.get_verifying_key()
+        recipient_public_key = user_public_key(args["<to>"])
+        amount = int(args["<amount>"])
+
+        # fetch sender utxos
+        utxo_response = send_message("utxo", sender_public_key)
+        utxo = utxo_response["data"]
+
+        # prepare transaction
+        tx = prepare_simple_tx(utxo, sender_private_key,
+                               recipient_public_key, amount)
+
+        # Send transactions to the bank
+        response = send_message("tx", tx)
+        print(response)
+
+    else:
+        print("Invalid command")
+
+if __name__ == "__main__":
+    args = docopt(__doc__)
+    main(args)
