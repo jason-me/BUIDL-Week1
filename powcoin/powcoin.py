@@ -29,15 +29,16 @@ from identities import user_private_key, user_public_key, key_to_name, node_publ
 # of sha256 of serialization of the block is less than POW_TARGET:
 # int(mining_hash(serialize(block)), 16) < POW_TARGET
 # BITS = 2
-BITS = 4
+BITS = 16
 POW_TARGET = 1 << (256 - BITS)
 BLOCK_SUBSIDY = 50
 PORT = 10000
 node = None
+chain_lock = threading.Lock()
 
 # logging.basicConfig(level="INFO", format="%(asctime)-15s %(levelname)s %(message)s")
 # logging.basicConfig(level="INFO", format="%(message)s")
-logging.basicConfig(level="DEBUG", format="%(message)s")
+logging.basicConfig(level="DEBUG", format="%(threadName)-6s | %(message)s")
 logger = logging.getLogger(__name__)
 
 
@@ -161,6 +162,8 @@ def txn_iterator(chain):
         for height, block in enumerate(chain) for txn in block.txns)
 
 def get_last_shared_block(chain_one, chain_two):
+    # FIXME bad name
+    # FIXME can we just use locate_block?
     for height, (b1, b2) in enumerate(zip(chain_one, chain_two)):
         if b1.id != b2.id:
             return height - 1
@@ -186,8 +189,7 @@ class Node:
         self.utxo_set = {}
         self.mempool = []
         self.peers = set()
-        self.address = (node_id, PORT)
-        self.chain_lock = threading.Lock()
+        self.address = (f"node{node_id}", PORT)
         self.syncing = False
 
     def join_network(self, peers):
@@ -242,7 +244,7 @@ class Node:
         for index, tx_in in enumerate(tx.tx_ins):
             # TxIn spending an unspent output
             assert tx_in.outpoint in self.utxo_set, \
-                   f"{tx_in} not in utxo_set"
+                   f"{tx_in.outpoint} not in utxo_set"
 
             # Grab the tx_out
             tx_out = self.utxo_set[tx_in.outpoint]
@@ -286,12 +288,13 @@ class Node:
             for peer in self.peers:
                 send_message(peer, "tx", tx)
 
-    def find_block(self, block):
-        for chain_index, chain in enumerate(self.chains):
-            for height, _block in enumerate(chain):
-                if block.id == _block.id:
-                    return chain_index, height
-        return None, None
+    def locate_block(self, block_id):
+        for chain_index, chain in enumerate(self.work_ordered_chains()):
+            for height, block in enumerate(chain):
+                if block.id == block_id:
+                    is_tip = height == len(chain) - 1
+                    return chain, chain_index, height, is_tip
+        return None, None, None, None
 
     def work_ordered_chains(self):
         def key(chain):
@@ -299,23 +302,18 @@ class Node:
              return len(chain) + int(is_active)
         return sorted(self.chains, key=key, reverse=True)
 
-    def find_prev_block(self, block):
-        for chain_index, chain in enumerate(self.work_ordered_chains()):
-            for height, _block in enumerate(chain):
-                if _block.id == block.prev_id:
-                    is_tip = height == len(chain) - 1
-                    chain_index = self.chains.index(chain)
-                    return chain, chain_index, height, is_tip
-
-        # FIXME ???
-        return None, None, None, None
-
-    def sync_utxo_set(self, chain, active_chain):
+    def sync_utxo_set(self, chain):
 
         if self.active_chain_index != self.chains.index(chain):
             logger.info(f"ACTIVE BRANCH CHANGE: {self.active_chain_index} -> {self.chains.index(chain)}")
 
-        rollback_blocks, sync_blocks = self.chain_diffs(active_chain, chain)
+        # FIXME have to treat active chain separately 
+        # since it changes under our feet
+        if self.chains.index(chain) == self.active_chain_index:
+            sync_blocks = self.active_chain[-1:]
+            rollback_blocks = []
+        else:
+            rollback_blocks, sync_blocks = self.chain_diffs(chain)
 
         # Rollback every transaction in current active_chain but not in the new one
         # No exception handling here b/c failure would mean program is broken
@@ -360,33 +358,45 @@ class Node:
 
         # Add rolled-back transactions to the mempool
         for tx in rollback_txns:
-            if tx not in self.mempool:
-                self.mempool.append(tx)
+            if tx not in self.mempool and not tx.is_coinbase:
+                try:
+                    self.validate_tx(tx)
+                    self.mempool.append(tx)
+                except:
+                    # Kinda hacky, but this will reject coinbase txns
+                    logger.info("couldn't add back to mempool")
+                    continue
 
         # Remove freshly synced transactions from mempool
         for tx in sync_txns:
             if tx in self.mempool:
                 self.mempool.remove(tx)
-                logging.info(f"Removed tx from mempool. Now contains {len(self.mempool)}\n\n")
-        
+                logging.info(f"Removed tx from mempool")
+
+        # Sanity check
+        prev_id = self.active_chain[0].id
+        for block in self.active_chain[1:]:
+            assert block.prev_id == prev_id
+            prev_id = block.id
+
         # If everything worked update the "active chain"
         self.active_chain_index = self.chains.index(chain)
-        logging.info(f"Block accepted: index={self.active_chain_index} height={len(self.active_chain) - 1} txns={len(block.txns)}")
 
     def validate_block(self, block):
         # Check POW
         assert int(block.id, 16) < POW_TARGET, "Insufficient Proof-of-Work"
 
-    def chain_diffs(self, from_chain, to_chain):
+    def chain_diffs(self, to_chain):
         """Calculate blocks unique to each chain"""
-        fork_height = get_last_shared_block(from_chain, to_chain)
-        rollback_blocks = from_chain[fork_height+1:]
+        fork_height = get_last_shared_block(self.active_chain, to_chain)
+        rollback_blocks = self.active_chain[fork_height+1:]
         sync_blocks = to_chain[fork_height+1:]
         return rollback_blocks, sync_blocks
 
-    def create_branch(self, chain_index, height):
+    def create_branch(self, chain_index, height, base_chain):
         # +1 b/c we want to include this block
-        base_chain = self.chains[chain_index][:height+1]  
+        base_chain = base_chain[:height+1]  
+        assert height+1 == len(base_chain), f"{height+1} | {len(base_chain)}"
         self.chains.append(base_chain)
         new_chain_index = len(self.chains) - 1
         logging.info(f"CREATED FORK (index={new_chain_index})")
@@ -395,41 +405,57 @@ class Node:
 
     def handle_block(self, block):
         # Claim the lock
-        with self.chain_lock:
+        with chain_lock:
+            # see if it's new
+            chain, _, _, _ = self.locate_block(block.id)
+            if chain:
+                # already know about it
+                raise Exception("already seen it")
 
             # Validate the block
             self.validate_block(block)
 
-            # FIXME
-            active_chain = deepcopy(self.active_chain)  
-
             # If this is a new fork, we need to create a new chain
-            chain, chain_index, height, is_tip = self.find_prev_block(block)
+            chain, chain_index, height, is_tip = self.locate_block(block.prev_id)
+
+            # FIXME: what to do if chain_index / height come back None???
+            # (orphan blocks ...)
+            # e.g. while doing ibd you get the tip of the real chain ...
+            # this causes an exception right now ...
             if not is_tip:
-                chain, chain_index = self.create_branch(chain_index, height)
+                chain, chain_index = self.create_branch(chain_index, height, chain)
 
             # Add to the chain
             chain.append(block)
 
             # Resync the UTXO database if the "work record" was broken
-            if total_work(chain) > total_work(active_chain):
+            # Or if we're extending the active chain
+            if total_work(chain) > total_work(self.active_chain) or \
+                    self.chains.index(chain) == self.active_chain_index:
                 try:
-                    self.sync_utxo_set(chain, active_chain)
+                    self.sync_utxo_set(chain)
                 except:
                     import traceback
                     logger.info(traceback.format_exc())
+                    return
 
             # Tell peers
+            # time.sleep(random.random())
             for peer in self.peers:
                 send_message(peer, "block", block)
 
-        # FIXME
-        logging.info(f"Active chain index is {self.active_chain_index}. Active chain height is {len(self.active_chain) - 1}")
+            # FIXME
+            logging.info(f"Block accepted: chain={self.active_chain_index} height={len(self.active_chain) - 1} txns={len(block.txns)}")
+
+            # Sanity checks
+            assert len(self.active_chain) == \
+                   max([len(chain) for chain in self.chains])
+
+            for chain in self.chains:
+                assert len(set([block.id for block in chain])) == len(chain)
 
     def initial_block_download(self):
         # just talk to one peer for now
-        self.syncing = True
-
         # FIXME
         if len(self.peers):
             peer = next(iter(self.peers))
@@ -493,11 +519,11 @@ def mining_hash(s):
     return hashlib.sha256(s).hexdigest()
 
 
-def mine_block(block):
-    nonce = 0
+def mine_block(block, step=3):
+    nonce = int(os.environ["ID"])
     # FIXME: make this line more readable
     while int(mining_hash(block.header(nonce)), 16) >= POW_TARGET:
-        nonce += 1
+        nonce += step  # Hack to make mining more competitive
         if mining_interrupt.is_set():
             logger.info("Mining interrupted")
             mining_interrupt.clear()
@@ -509,21 +535,27 @@ def mine_block(block):
 def mine_forever(public_key):
     logging.info("Starting miner")
     while True:
-        coinbase = prepare_coinbase(public_key, len(node.active_chain) - 1)
-        logging.info(f"Top of mining loop. Mempool contains {len(node.mempool)} txns")
-        # logging.info([coinbase] + deepcopy(node.mempool))
-        unmined_block = Block(
-            txns=[coinbase] + deepcopy(node.mempool),
-            prev_id=node.active_chain[-1].id,
-        )
+        with chain_lock:
+            coinbase = prepare_coinbase(public_key, len(node.active_chain) - 1)
+            logging.info(f"Top of mining loop. Mempool contains {len(node.mempool)} txns")
+            # logging.info([coinbase] + deepcopy(node.mempool))
+            unmined_block = Block(
+                txns=[coinbase] + deepcopy(node.mempool),
+                prev_id=node.active_chain[-1].id,
+            )
         mined_block = mine_block(unmined_block)
         
         # This is False if mining was interrupted
         # Perhaps an exception would be wiser ...
         if mined_block:
-            logging.info(f"Mined a block w/ txns")
-            # logging.info(mined_block.txns)
-            node.handle_block(mined_block)
+            logger.info("")
+            logger.info(f"Mined a block w/ txns")
+            # FIXME
+            try:
+                node.handle_block(mined_block)
+            except:
+                import traceback
+                logger.info(traceback.format_exc())
 
 
 ##############
@@ -564,13 +596,12 @@ class TCPHandler(socketserver.BaseRequestHandler):
                 return
 
             logging.info(f"Received block from peer")
-            chain_index, height = node.find_block(data)
 
-            # If we can't find the block locally, let's add it
-            if chain_index == height == None:
+            try:
                 node.handle_block(data)
-                # Tell the mining thread mine the new tip
                 mining_interrupt.set()
+            except:
+                pass
 
             # If syncing, request next block
             if node.syncing:
@@ -578,7 +609,7 @@ class TCPHandler(socketserver.BaseRequestHandler):
 
         if command == "tx":
             node.handle_tx(data)
-
+    
         if command == "balance":
             balance = node.fetch_balance(data)
             self.respond(command="balance-response", data=balance)
@@ -620,18 +651,17 @@ def serve():
 
 def send_message(address, command, data, response=False, retries=3):
     if retries == 0:
-        return None
+        raise Exception("connection error")
     message = prepare_message(command, data)
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         try:
             s.connect(address)
             s.sendall(serialize(message))
-
             if response:
                 return deserialize(s.recv(5000))
         except:
             logger.info("retrying")
-            time.sleep(0.01)
+            time.sleep(.1)
             return send_message(address, command, data, response, 
                          retries=retries-1)
             
@@ -642,7 +672,7 @@ def send_message(address, command, data, response=False, retries=3):
 
 def main(args):
     if args["serve"]:
-        logger.info("hello, world")
+        threading.current_thread().name = "main"
 
         # FIXME: needs coinbase
         # genesis_block = Block(
@@ -669,45 +699,34 @@ def main(args):
         # FIXME: this is a mess
         genesis_coinbase = prepare_coinbase(public_key=user_public_key("alice"), height=0)
         unmined_genesis_block = Block(txns=[genesis_coinbase], prev_id=None)
-        mined_genesis_block = mine_block(unmined_genesis_block)
+        mined_genesis_block = mine_block(unmined_genesis_block, step=1)
         node.chains.append([mined_genesis_block])
         node.active_chain_index = 0
         node.add_tx_to_utxo_set(genesis_coinbase)
 
-        # FIXME
-        # start the first node early
-        if node_id == 0:
-            logger.info("starting miner")
-            mining_public_key = node_public_key(node_id)
-            thread = threading.Thread(target=mine_forever, args=(mining_public_key,))
-            thread.start()
-
-
-
         # First thing, start server in another thread
-        server_thread = threading.Thread(target=serve)
+        server_thread = threading.Thread(target=serve, name="server")
         server_thread.start()
 
         # Join the network
         peers = {(p, PORT) for p in os.environ['PEERS'].split(',')}
-        node.join_network(peers)
+        # first one will fail b/c no peers yet. 
+        try:
+            node.join_network(peers)
+        except:
+            pass
 
         # Do initial block download
         logger.info("starting ibd")
+        node.syncing = True
         node.initial_block_download()
 
-        # Wait until IBD completes
-        while node.syncing:
-            logger.info(f"still syncing {node.syncing}")
-            time.sleep(1)
-
         # Run the miner in a thread
-        if node_id != 0:
-            logger.info("starting miner")
-            node_id = int(os.environ["ID"])
-            mining_public_key = node_public_key(node_id)
-            thread = threading.Thread(target=mine_forever, args=(mining_public_key,))
-            thread.start()
+        logger.info("starting miner")
+        node_id = int(os.environ["ID"])
+        mining_public_key = node_public_key(node_id)
+        miner_thread = threading.Thread(target=mine_forever, args=(mining_public_key,), name="miner")
+        miner_thread.start()
 
     elif args["ping"]:
         address = address_from_host(args["--node"])
@@ -718,6 +737,8 @@ def main(args):
         response = send_message(address, "balance", public_key, response=True)
         logger.info(response["data"])
 
+
+    
     elif args["utxos"]:
         public_key = user_public_key(args["<name>"])
         address = external_address(args["--node"])
