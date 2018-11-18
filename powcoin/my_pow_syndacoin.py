@@ -334,7 +334,7 @@ def main(args):
         node = Node()
 
         # TODO: mine genesis block
-        #mine_gensis_block()
+        mine_genesis_block()
 
         # Start server thread
         server_thread = threading.Thread(target=serve, name="server")
