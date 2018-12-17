@@ -21,6 +21,7 @@ from identities import user_private_key, user_public_key
 
 
 PORT = 10000
+BLOCK_SUBSIDY = 50
 node = None
 
 logging.basicConfig(level="INFO", format='%(threadName)-6s | %(message)s')
@@ -47,6 +48,10 @@ class Tx:
         tx_in = self.tx_ins[index]
         message = spend_message(self, index)
         return public_key.verify(tx_in.signature, message)
+
+    @property
+    def is_coinbase(self):
+        return self.tx_ins[0].tx_id is None
 
 class TxIn:
 
@@ -111,8 +116,10 @@ class Node:
 
     def update_utxo_set(self, tx):
         # Remove utxos that were just spent
+        if not tx.is_coinbase:
         for tx_in in tx.tx_ins:
             del self.utxo_set[tx_in.outpoint]
+
         # Save utxos which were just created
         for tx_out in tx.tx_outs:
             self.utxo_set[tx_out.outpoint] = tx_out
@@ -151,6 +158,10 @@ class Node:
         # Check no value created or destroyed
         assert in_sum == out_sum
 
+    def validate_coinbase(self, tx):
+        assert len(tx.tx_ins) == len(tx.tx_outs) == 1
+        assert tx.tx_outs[0].amount == BLOCK_SUBSIDY
+
     def handle_tx(self, tx):
         self.validate_tx(tx)
         self.mempool.append(tx)
@@ -163,8 +174,11 @@ class Node:
         # Check work, chain ordering
         self.validate_block(block)
 
+        # Validate coinbase separately
+        self.validate_coinbase(block.txns[0])
+
         # Check the transactions are valid
-        for tx in block.txns:
+        for tx in block.txns[1:]:
             self.validate_tx(tx)
 
         # If they're all good, update self.blocks and self.utxo_set
@@ -208,7 +222,8 @@ def prepare_simple_tx(utxos, sender_private_key, recipient_public_key, amount):
     for i in range(len(tx.tx_ins)):
         tx.sign_input(i, sender_private_key)
 
-def prepare_coinbase(public_key):
+def prepare_coinbase(public_key, tx_id=None):
+    if tx_id is None:
     tx_id = uuid.uuid4()
     return Tx(
         id=tx_id,
@@ -241,10 +256,10 @@ def mine_block(block):
     return block
 
 
-def mine_forever():
+def mine_forever(public_key):
     logging.info("Starting miner")
     while True:
-        coinbase = prepare_coinbase(???)
+        coinbase = prepare_coinbase(public_key)
         unmined_block = Block(
             txns=[coinbase] + node.mempool,
             prev_id=node.blocks[-1].id,
@@ -257,12 +272,13 @@ def mine_forever():
             logger.info("Mined a block")
             node.handle_block(mined_block)
 
-def mine_genesis_block():
+def mine_genesis_block(public_key):
     global node
-    unmined_block = Block(txns=[], prev_id=None, nonce=0)
+    coinbase = prepare_coinbase[public_key, tx_id="abc123"]
+    unmined_block = Block(txns=[coinbase], prev_id=None, nonce=0)
     mined_block = mine_block(unmined_block)
     node.blocks.append(mined_block)
-    # TODO: update utxo set, award coinbase, etc
+    node.update_utxo_set(coinbase)
 
 
 ##############
@@ -332,6 +348,15 @@ def send_message(address, command, data, response=False):
 # CLI #
 #######
 
+def lookup_private_key(name):
+    exponent = {
+        "alice": 1, "bob": 2, "node0": 3, "node1": 4, "node2": 5
+    }[name]
+    return SigningKey.from_secret_exponent(exponent, curve=SECP256k1)
+
+def lookup_public_key(name):
+    return lookup_private_key(name).get_verifying_key()
+
 def main(args):
     if args["serve"]:
         global node
@@ -345,7 +370,9 @@ def main(args):
         server_thread.start()
 
         # Start miner thread
-        miner_thread = threading.Thread(target=mine_forever, name="miner")
+        # TODO: figure out miner public key
+        miner_thread = threading.Thread(target=mine_forever,
+                args=[public_key], name="miner")
         miner_thread.start()
 
     elif args["ping"]:
