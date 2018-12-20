@@ -1,10 +1,12 @@
 """
 POW Syndacoin
+
 Usage:
   pow_syndacoin.py.py serve
   pow_syndacoin.py.py ping [--node <node>]
   pow_syndacoin.py.py tx <from> <to> <amount> [--node <node>]
   pow_syndacoin.py.py balance <name> [--node <node>]
+
 Options:
   -h --help      Show this screen.
   --node=<node>  Hostname of node [default: node0]
@@ -50,6 +52,9 @@ class Tx:
     def is_coinbase(self):
         return self.tx_ins[0].tx_id is None
 
+    def __eq__(self, other):
+        return self.id == other.id
+
 class TxIn:
 
     def __init__(self, tx_id, index, signature=None):
@@ -94,6 +99,7 @@ class Block:
 
     def __repr__(self):
         return f"Block(prev_id={self.prev_id[:10]}... id={self.id[:10]}...)"
+
 
 class Node:
 
@@ -160,8 +166,13 @@ class Node:
         assert tx.tx_outs[0].amount == BLOCK_SUBSIDY
 
     def handle_tx(self, tx):
-        self.validate_tx(tx)
-        self.mempool.append(tx)
+        if tx not in self.mempool:
+            self.validate_tx(tx)
+            self.mempool.append(tx)
+
+        # Propagate transaction
+        for peer_address in self.peer_addresses:
+            send_message(peer_address, "tx", tx)
 
     def validate_block(self, block):
         assert block.proof < POW_TARGET, "Insufficient Proof-of-Work"
@@ -218,6 +229,8 @@ def prepare_simple_tx(utxos, sender_private_key, recipient_public_key, amount):
     tx = Tx(id=tx_id, tx_ins=tx_ins, tx_outs=tx_outs)
     for i in range(len(tx.tx_ins)):
         tx.sign_input(i, sender_private_key)
+
+        return tx
 
 def prepare_coinbase(public_key, tx_id=None):
     if tx_id is None:
@@ -276,7 +289,6 @@ def mine_genesis_block(public_key):
     mined_block = mine_block(unmined_block)
     node.blocks.append(mined_block)
     node.update_utxo_set(coinbase)
-
 
 ##############
 # Networking #
@@ -369,7 +381,6 @@ def main(args):
         server_thread.start()
 
         # Start miner thread
-        # TODO: figure out miner public key
         miner_public_key = lookup_public_key(name)
         miner_thread = threading.Thread(target=mine_forever,
                 args=[miner_public_key], name="miner")
