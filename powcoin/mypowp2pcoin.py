@@ -17,9 +17,6 @@ from copy import deepcopy
 from ecdsa import SigningKey, SECP256k1
 from utils import serialize, deserialize
 
-from identities import user_private_key, user_public_key
-
-
 PORT = 10000
 BLOCK_SUBSIDY = 50
 node = None
@@ -359,11 +356,13 @@ def lookup_public_key(name):
 
 def main(args):
     if args["serve"]:
+        name = os.environ["NAME"]
+
         global node
         node = Node()
 
-        # TODO: mine genesis block
-        mine_genesis_block()
+        # Alice is Satoshi!!!
+        mine_genesis_block(lookup_public_key("alice"))
 
         # Start server thread
         server_thread = threading.Thread(target=serve, name="server")
@@ -371,23 +370,24 @@ def main(args):
 
         # Start miner thread
         # TODO: figure out miner public key
+        miner_public_key = lookup_public_key(name)
         miner_thread = threading.Thread(target=mine_forever,
-                args=[public_key], name="miner")
+                args=[miner_public_key], name="miner")
         miner_thread.start()
 
     elif args["ping"]:
         address = address_from_host(args["--node"])
         send_message(address, "ping", "")
     elif args["balance"]:
-        public_key = user_public_key(args["<name>"])
+        public_key = lookup_public_key(args["<name>"])
         address = external_address(args["--node"])
         response = send_message(address, "balance", public_key, response=True)
         print(response["data"])
     elif args["tx"]:
         # Grab parameters
-        sender_private_key = user_private_key(args["<from>"])
+        sender_private_key = lookup_private_key(args["<from>"])
         sender_public_key = sender_private_key.get_verifying_key()
-        recipient_private_key = user_private_key(args["<to>"])
+        recipient_private_key = lookup_private_key(args["<to>"])
         recipient_public_key = recipient_private_key.get_verifying_key()
         amount = int(args["<amount>"])
         address = external_address(args["--node"])
