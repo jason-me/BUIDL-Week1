@@ -114,8 +114,8 @@ class Node:
     def update_utxo_set(self, tx):
         # Remove utxos that were just spent
         if not tx.is_coinbase:
-        for tx_in in tx.tx_ins:
-            del self.utxo_set[tx_in.outpoint]
+            for tx_in in tx.tx_ins:
+                del self.utxo_set[tx_in.outpoint]
 
         # Save utxos which were just created
         for tx_out in tx.tx_outs:
@@ -221,7 +221,7 @@ def prepare_simple_tx(utxos, sender_private_key, recipient_public_key, amount):
 
 def prepare_coinbase(public_key, tx_id=None):
     if tx_id is None:
-    tx_id = uuid.uuid4()
+        tx_id = uuid.uuid4()
     return Tx(
         id=tx_id,
         tx_ins=[
@@ -237,7 +237,7 @@ def prepare_coinbase(public_key, tx_id=None):
 # Mining #
 ##########
 
-DIFFICULTY_BITS = 20
+DIFFICULTY_BITS = 15
 POW_TARGET = 2 ** (256 - DIFFICULTY_BITS)
 mining_interrupt = threading.Event()
 
@@ -271,7 +271,7 @@ def mine_forever(public_key):
 
 def mine_genesis_block(public_key):
     global node
-    coinbase = prepare_coinbase[public_key, tx_id="abc123"]
+    coinbase = prepare_coinbase(public_key, tx_id="abcd1234")
     unmined_block = Block(txns=[coinbase], prev_id=None, nonce=0)
     mined_block = mine_block(unmined_block)
     node.blocks.append(mined_block)
