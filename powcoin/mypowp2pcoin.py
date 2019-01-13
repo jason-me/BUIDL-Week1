@@ -12,14 +12,15 @@ Options:
   --node=<node>  Hostname of node [default: node0]
 """
 
-import uuid, socketserver, socket, sys, argparse, time, os, logging, threading, hashlib, random, re
+import uuid, socketserver, socket, sys, argparse, time, os, logging, \
+    threading, hashlib, random, re, pickle
 
 from docopt import docopt
 from copy import deepcopy
 from ecdsa import SigningKey, SECP256k1
-from utils import serialize, deserialize
 
 PORT = 10000
+GET_BLOCKS_CHUNK = 10
 BLOCK_SUBSIDY = 50
 node = None
 
@@ -30,6 +31,7 @@ logger = logging.getLogger(__name__)
 def spend_message(tx, index):
     outpoint = tx.tx_ins[index].outpoint
     return serialize(outpoint) + serialize(tx.tx_outs)
+
 
 class Tx:
 
@@ -55,6 +57,7 @@ class Tx:
     def __eq__(self, other):
         return self.id == other.id
 
+
 class TxIn:
 
     def __init__(self, tx_id, index, signature=None):
@@ -65,6 +68,7 @@ class TxIn:
     @property
     def outpoint(self):
         return (self.tx_id, self.index)
+
 
 class TxOut:
 
@@ -77,6 +81,7 @@ class TxOut:
     @property
     def outpoint(self):
         return (self.tx_id, self.index)
+
 
 class Block:
 
@@ -120,9 +125,11 @@ class Node:
             except:
                 logger.info(f'(handshake) Node {peer[0]} offline')
 
-    @property
-    def mempool_outpoints(self):
-        return [tx_in.outpoint for tx in self.mempool for tx_in in tx.tx_ins]
+    def sync(self):
+        blocks = self.blocks[-GET_BLOCKS_CHUNK:]
+        block_ids = [block.id for block in blocks]
+        for peer in self.peers:
+            send_message(peer, "sync", block_ids)
 
     def fetch_utxos(self, public_key):
         return [tx_out for tx_out in self.utxo_set.values()
@@ -138,6 +145,10 @@ class Node:
         for tx_out in tx.tx_outs:
             self.utxo_set[tx_out.outpoint] = tx_out
 
+        # Clean up mempool
+        # if tx in self.mempool:
+        #    self.mempool.remove(tx)
+
     def fetch_balance(self, public_key):
         # Fetch utxos associated with this public key
         utxos = self.fetch_utxos(public_key)
@@ -152,7 +163,7 @@ class Node:
             assert tx_in.outpoint in self.utxo_set
 
             # No pending transactions spending this same output
-            assert tx_in.outpoint not in self.mempool_outpoints
+            # assert tx_in.outpoint not in self.mempool_outpoints
 
             # Grab the tx_out
             tx_out = self.utxo_set[tx_in.outpoint]
@@ -211,7 +222,8 @@ class Node:
 
         # Block propogation
         for peer in self.peers:
-            send_message(peer, "block", block)
+            send_message(peer, "blocks", [block])
+
 
 def prepare_simple_tx(utxos, sender_private_key, recipient_public_key, amount):
     sender_public_key = sender_private_key.get_verifying_key()
@@ -220,7 +232,8 @@ def prepare_simple_tx(utxos, sender_private_key, recipient_public_key, amount):
     tx_ins = []
     tx_in_sum = 0
     for tx_out in utxos:
-        tx_ins.append(TxIn(tx_id=tx_out.tx_id, index=tx_out.index, signature=None))
+        tx_ins.append(TxIn(tx_id=tx_out.tx_id, index=tx_out.index,
+                      signature=None))
         tx_in_sum += tx_out.amount
         if tx_in_sum > amount:
             break
@@ -232,8 +245,10 @@ def prepare_simple_tx(utxos, sender_private_key, recipient_public_key, amount):
     tx_id = uuid.uuid4()
     change = tx_in_sum - amount
     tx_outs = [
-        TxOut(tx_id=tx_id, index=0, amount=amount, public_key=recipient_public_key),
-        TxOut(tx_id=tx_id, index=1, amount=change, public_key=sender_public_key),
+        TxOut(tx_id=tx_id, index=0, amount=amount,
+              public_key=recipient_public_key),
+        TxOut(tx_id=tx_id, index=1, amount=change,
+              public_key=sender_public_key),
     ]
 
     # Construct tx and sign inputs
@@ -242,6 +257,7 @@ def prepare_simple_tx(utxos, sender_private_key, recipient_public_key, amount):
         tx.sign_input(i, sender_private_key)
 
         return tx
+
 
 def prepare_coinbase(public_key, tx_id=None):
     if tx_id is None:
@@ -260,6 +276,7 @@ def prepare_coinbase(public_key, tx_id=None):
 ##########
 # Mining #
 ##########
+
 
 DIFFICULTY_BITS = 15
 POW_TARGET = 2 ** (256 - DIFFICULTY_BITS)
@@ -293,6 +310,7 @@ def mine_forever(public_key):
             logger.info("Mined a block")
             node.handle_block(mined_block)
 
+
 def mine_genesis_block(public_key):
     global node
     coinbase = prepare_coinbase(public_key, tx_id="abcd1234")
@@ -305,11 +323,34 @@ def mine_genesis_block(public_key):
 # Networking #
 ##############
 
+def serialize(coin):
+    return pickle.dumps(coin)
+
+def deserialize(serialized):
+    return pickle.loads(serialized)
+
+def read_message(s):
+    message = b''
+    # Our protocol is: first 4 bytes signify message length
+    raw_message_length = s.recv(4) or b"\x00"
+    message_length = int.from_bytes(raw_message_length, 'big')
+
+    while message_length > 0:
+        chunk = s.recv(1024)
+        message += chunk
+        message_length -= len(chunk)
+
+    return deserialize(message)
+
 def prepare_message(command, data):
-    return {
+    message = {
         "command": command,
         "data": data,
     }
+    serialized_message = serialize(message)
+    length = len(serialized_message).to_bytes(4, 'big')
+    return length + serialized_message
+
 
 class TCPHandler(socketserver.BaseRequestHandler):
 
@@ -324,11 +365,11 @@ class TCPHandler(socketserver.BaseRequestHandler):
 
     def respond(self, command, data):
         response = prepare_message(command, data)
-        return self.request.sendall(serialize(response))
+        return self.request.sendall(response)
 
     def handle(self):
-        message_bytes = self.request.recv(1024*4).strip()
-        message = deserialize(message_bytes)
+        # message length + message
+        message = read_message(self.request)
         command = message["command"]
         data = message["data"]
 
@@ -353,10 +394,9 @@ class TCPHandler(socketserver.BaseRequestHandler):
                 # Request their peers
                 send_message(peer, "peers", None)
 
-        else:
-            assert peer in node.peers, \
-                f"Rejecting {command} from unconnected {peer[0]}"
-
+        # else:
+            # assert peer in node.peers, \
+                # f"Rejecting {command} from unconnected {peer[0]}"
 
         # Business Logic
 
@@ -370,11 +410,32 @@ class TCPHandler(socketserver.BaseRequestHandler):
         if command == "ping":
             self.respond(command="pong", data="")
 
-        if command == "block":
-            if data.prev_id == node.blocks[-1].id:
-                node.handle_block(data)
-                # Interrupt mining thread
-                mining_interrupt.set()
+        if command == "sync":
+            # Find most recent block that is not known by peer,
+            # but which builds off a block peer knows about.
+            peer_block_ids = data
+            for block in node.blocks[::-1]:
+                if block.id not in peer_block_ids \
+                        and block.prev_id in peer_block_ids:
+                    height = node.blocks.index(block)
+                    blocks = node.blocks[height:height+GET_BLOCKS_CHUNK]
+                    send_message(peer, "blocks", blocks)
+                    logger.info('Served "sync" request')
+                    return
+
+            logger.info('Could not serve "sync" request')
+
+        if command == "blocks":
+
+            for block in data:
+                try:
+                    node.handle_block(block)
+                    mining_interrupt.set()
+                except:
+                    logger.info(f"Rejected block {block.id}")
+
+            if len(data) == GET_BLOCKS_CHUNK:
+                node.sync()
 
         if command == "tx":
             node.handle_tx(data)
@@ -387,21 +448,24 @@ class TCPHandler(socketserver.BaseRequestHandler):
             utxos = node.fetch_utxos(data)
             self.respond(command="utxos-response", data=utxos)
 
+
 def external_address(node):
     i = int(node[-1])
     port = PORT + i
     return ('localhost', port)
+
 
 def serve():
     logger.info("Starting server")
     server = socketserver.TCPServer(("0.0.0.0", PORT), TCPHandler)
     server.serve_forever()
 
+
 def send_message(address, command, data, response=False):
     message = prepare_message(command, data)
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.connect(address)
-        s.sendall(serialize(message))
+        s.sendall(message)
         if response:
             return deserialize(s.recv(5000))
 
@@ -416,13 +480,18 @@ def lookup_private_key(name):
     }[name]
     return SigningKey.from_secret_exponent(exponent, curve=SECP256k1)
 
+
 def lookup_public_key(name):
     return lookup_private_key(name).get_verifying_key()
+
 
 def main(args):
     if args["serve"]:
         threading.current_thread().name = "main"
         name = os.environ["NAME"]
+
+        duration = 10 * ["node0", "node1", "node2"].index(name)
+        time.sleep(duration)
 
         global node
         node = Node(address=(name, PORT))
@@ -439,10 +508,19 @@ def main(args):
         for peer in peers:
             node.connect(peer)
 
+        # Wait for peer connections
+        time.sleep(1)
+
+        # Do initial block download
+        node.sync()
+
+        # Wait for initial block download to finish
+        time.sleep(1)
+
         # Start miner thread
         miner_public_key = lookup_public_key(name)
         miner_thread = threading.Thread(target=mine_forever,
-                args=[miner_public_key], name="miner")
+                                        args=[miner_public_key], name="miner")
         miner_thread.start()
 
     elif args["ping"]:
@@ -463,11 +541,13 @@ def main(args):
         address = external_address(args["--node"])
 
         # Fetch utxos available to spend
-        response = send_message(address, "utxos", sender_public_key, response=True)
+        response = send_message(address, "utxos", sender_public_key,
+                                response=True)
         utxos = response["data"]
 
         # Prepare transaction
-        tx = prepare_simple_tx(utxos, sender_private_key, recipient_public_key, amount)
+        tx = prepare_simple_tx(utxos, sender_private_key,
+                               recipient_public_key, amount)
 
         # send to node
         send_message(address, "tx", tx)
