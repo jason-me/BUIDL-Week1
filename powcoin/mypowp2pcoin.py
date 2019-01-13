@@ -23,6 +23,7 @@ PORT = 10000
 GET_BLOCKS_CHUNK = 10
 BLOCK_SUBSIDY = 50
 node = None
+lock = threading.Lock()
 
 logging.basicConfig(level="INFO", format='%(threadName)-6s | %(message)s')
 logger = logging.getLogger(__name__)
@@ -146,8 +147,8 @@ class Node:
             self.utxo_set[tx_out.outpoint] = tx_out
 
         # Clean up mempool
-        # if tx in self.mempool:
-        #    self.mempool.remove(tx)
+        if tx in self.mempool:
+            self.mempool.remove(tx)
 
     def fetch_balance(self, public_key):
         # Fetch utxos associated with this public key
@@ -192,9 +193,9 @@ class Node:
             self.validate_tx(tx)
             self.mempool.append(tx)
 
-        # Propagate transaction
-        for peer in self.peers:
-            send_message(peer, "tx", tx)
+            # Propagate transaction
+            for peer in self.peers:
+                send_message(peer, "tx", tx)
 
     def validate_block(self, block):
         assert block.proof < POW_TARGET, "Insufficient Proof-of-Work"
@@ -256,7 +257,7 @@ def prepare_simple_tx(utxos, sender_private_key, recipient_public_key, amount):
     for i in range(len(tx.tx_ins)):
         tx.sign_input(i, sender_private_key)
 
-        return tx
+    return tx
 
 
 def prepare_coinbase(public_key, tx_id=None):
@@ -269,7 +270,7 @@ def prepare_coinbase(public_key, tx_id=None):
         ],
         tx_outs=[
             TxOut(tx_id=tx_id, index=0, amount=BLOCK_SUBSIDY,
-                  public_key=public_key)
+                  public_key=public_key),
         ],
     )
 
@@ -308,7 +309,8 @@ def mine_forever(public_key):
         if mined_block:
             logger.info("")
             logger.info("Mined a block")
-            node.handle_block(mined_block)
+            with lock:
+                node.handle_block(mined_block)
 
 
 def mine_genesis_block(public_key):
@@ -429,10 +431,11 @@ class TCPHandler(socketserver.BaseRequestHandler):
 
             for block in data:
                 try:
-                    node.handle_block(block)
+                    with lock:
+                        node.handle_block(block)
                     mining_interrupt.set()
                 except:
-                    logger.info(f"Rejected block {block.id}")
+                    logger.info("Rejected block")
 
             if len(data) == GET_BLOCKS_CHUNK:
                 node.sync()
@@ -467,7 +470,7 @@ def send_message(address, command, data, response=False):
         s.connect(address)
         s.sendall(message)
         if response:
-            return deserialize(s.recv(5000))
+            return read_message(s)
 
 
 #######
