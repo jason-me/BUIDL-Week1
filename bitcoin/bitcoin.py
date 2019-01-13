@@ -1,11 +1,11 @@
 """
-POWCoin
+Bitcoin
 
 Usage:
-  powcoin.py serve
-  powcoin.py ping [--node <node>]
-  powcoin.py tx <from> <to> <amount> [--node <node>]
-  powcoin.py balance <name> [--node <node>]
+  bitcoin.py serve
+  bitcoin.py ping [--node <node>]
+  bitcoin.py tx <from> <to> <amount> [--node <node>]
+  bitcoin.py balance <name> [--node <node>]
 
 Options:
   -h --help      Show this screen.
@@ -19,10 +19,18 @@ from copy import deepcopy
 from ecdsa import SigningKey, SECP256k1
 
 PORT = 10000
-GET_BLOCKS_CHUNK = 10
-BLOCK_SUBSIDY = 50
 node = None
 lock = threading.Lock()
+mining_interrupt = threading.Event()
+
+SATOSHIS_PER_COIN = 100_000_000
+GET_BLOCKS_CHUNK = 10
+HALVENING_INTERVAL = 60 * 24            # daily (assuming 1 minute blocks)
+
+INITIAL_DIFFICULTY_BITS = 17
+BLOCK_TIME_IN_SECS = 1
+BLOCKS_PER_DIFFICULTY_PERIOD = 5
+DIFFICULTY_PERIOD_IN_SECS = BLOCK_TIME_IN_SECS * BLOCKS_PER_DIFFICULTY_PERIOD
 
 logging.basicConfig(level="INFO", format='%(threadName)-6s | %(message)s')
 logger = logging.getLogger(__name__)
@@ -33,7 +41,7 @@ def spend_message(tx, index):
     return serialize(outpoint) + serialize(tx.tx_outs)
 
 def total_work(blocks):
-    return len(blocks)
+    return sum([2**block.bits for block in blocks])
 
 def tx_in_to_tx_out(tx_in, blocks):
     for block in blocks:
@@ -90,10 +98,12 @@ class TxOut:
 
 class Block:
 
-    def __init__(self, txns, prev_id, nonce):
+    def __init__(self, txns, prev_id, nonce, bits, timestamp):
         self.txns = txns
         self.prev_id = prev_id
         self.nonce = nonce
+        self.bits = bits
+        self.timestamp = timestamp
 
     @property
     def header(self):
@@ -106,6 +116,10 @@ class Block:
     @property
     def proof(self):
         return int(self.id, 16)
+
+    @property
+    def target(self):
+        return 2 ** (256 - self.bits)
 
     def __eq__(self, other):
         return self.id == other.id
@@ -203,11 +217,13 @@ class Node:
             out_sum += tx_out.amount
 
         # Check no value created or destroyed
-        assert in_sum == out_sum
+        assert in_sum >= out_sum
 
-    def validate_coinbase(self, tx):
+    def validate_coinbase(self, block):
+        tx = block.txns[0]
         assert len(tx.tx_ins) == len(tx.tx_outs) == 1
-        assert tx.tx_outs[0].amount == BLOCK_SUBSIDY
+        fees = self.calculate_fees(block.txns[1:])
+        assert tx.tx_outs[0].amount == self.get_block_subsidy() + fees
 
     def handle_tx(self, tx):
         if tx not in self.mempool:
@@ -219,12 +235,23 @@ class Node:
                 send_message(peer, "tx", tx)
 
     def validate_block(self, block, validate_txns=False):
-        assert block.proof < POW_TARGET, "Insufficient Proof-of-Work"
+        assert block.proof < block.target, "Insufficient Proof-of-Work"
 
         if validate_txns:
+            # Check block timestamps cannot be too far in future
+            assert block.timestamp - time.time() < DIFFICULTY_PERIOD_IN_SECS,\
+                "Block too far in future"
+
+            # Block timestamps must advance every block period
+            height = max(len(self.blocks) - BLOCKS_PER_DIFFICULTY_PERIOD, 0)
+            assert block.timestamp > self.blocks[height].timestamp,\
+                "Block periods cannot go backwards in time"
+
+            # Check difficulty adjustment
+            assert block.bits == self.get_next_bits(block.prev_id, log=True)
 
             # Validate coinbase separately
-            self.validate_coinbase(block.txns[0])
+            self.validate_coinbase(block)
 
             # Check the transactions are valid
             for tx in block.txns[1:]:
@@ -317,7 +344,61 @@ class Node:
         for tx in block.txns:
             self.connect_tx(tx)
 
-def prepare_simple_tx(utxos, sender_private_key, recipient_public_key, amount):
+    def get_block_subsidy(self):
+        halvings = len(self.blocks) // HALVENING_INTERVAL
+        return (50 * SATOSHIS_PER_COIN) // (2 ** halvings)
+
+    def calculate_fees(self, txns):
+        fees = 0
+        for txn in txns:
+            inputs = outputs = 0
+            for tx_in in txn.tx_ins:
+                inputs += self.utxo_set[tx_in.outpoint].amount
+            for tx_out in txn.tx_outs:
+                outputs += tx_out.amount
+            fees += inputs - outputs
+        return fees
+
+    def get_next_bits(self, block_id, log=False):
+        # Find the block
+        height = [block.id for block in self.blocks].index(block_id)
+        block = self.blocks[height]
+
+        # Will we enter a new difficulty period?
+        next_height = height + 1
+        next_block_period = next_height // BLOCKS_PER_DIFFICULTY_PERIOD
+        next_block_period_height = next_height % BLOCKS_PER_DIFFICULTY_PERIOD
+
+        # Only change bits if we're entering a new difficulty period
+        if next_block_period_height != 0:
+            return block.bits
+
+        # Calculate how long this difficulty period lasted
+        one_period_ago_index = max(
+            height - BLOCKS_PER_DIFFICULTY_PERIOD, 0)
+        one_period_ago_block = self.blocks[one_period_ago_index]
+        period_duration = block.timestamp - one_period_ago_block.timestamp
+
+        # Calculate next bits
+        if period_duration <= DIFFICULTY_PERIOD_IN_SECS:
+            next_bits = block.bits + 1
+        else:
+            next_bits = block.bits - 1
+
+        # Log some information
+        if log:
+            logger.info(
+                "(difficulty adjustment) "
+                f"period={next_block_period} "
+                f"target={DIFFICULTY_PERIOD_IN_SECS} "
+                f"duration={period_duration} "
+                f"bits={block.bits}->{next_bits} "
+            )
+        
+        return next_bits
+
+
+def prepare_simple_tx(utxos, sender_private_key, recipient_public_key, amount, fee):
     sender_public_key = sender_private_key.get_verifying_key()
 
     # Construct tx.tx_outs
@@ -326,15 +407,15 @@ def prepare_simple_tx(utxos, sender_private_key, recipient_public_key, amount):
     for tx_out in utxos:
         tx_ins.append(TxIn(tx_id=tx_out.tx_id, index=tx_out.index, signature=None))
         tx_in_sum += tx_out.amount
-        if tx_in_sum > amount:
+        if tx_in_sum > amount + fee:
             break
 
     # Make sure sender can afford it
-    assert tx_in_sum >= amount
+    assert tx_in_sum >= amount + fee
 
     # Construct tx.tx_outs
     tx_id = uuid.uuid4()
-    change = tx_in_sum - amount
+    change = tx_in_sum - (amount + fee)
     tx_outs = [
         TxOut(tx_id=tx_id, index=0, amount=amount, public_key=recipient_public_key), 
         TxOut(tx_id=tx_id, index=1, amount=change, public_key=sender_public_key),
@@ -347,7 +428,7 @@ def prepare_simple_tx(utxos, sender_private_key, recipient_public_key, amount):
 
     return tx
 
-def prepare_coinbase(public_key, tx_id=None):
+def prepare_coinbase(public_key, block_subsidy, tx_id=None):
     if tx_id is None:
         tx_id = uuid.uuid4()
     return Tx(
@@ -356,7 +437,7 @@ def prepare_coinbase(public_key, tx_id=None):
             TxIn(None, None, None),    
         ],
         tx_outs=[
-            TxOut(tx_id=tx_id, index=0, amount=BLOCK_SUBSIDY,
+            TxOut(tx_id=tx_id, index=0, amount=block_subsidy,
                   public_key=public_key),
         ],
     )
@@ -365,13 +446,8 @@ def prepare_coinbase(public_key, tx_id=None):
 # Mining #
 ##########
 
-DIFFICULTY_BITS = 15
-POW_TARGET = 2 ** (256 - DIFFICULTY_BITS)
-mining_interrupt = threading.Event()
-
-
 def mine_block(block):
-    while block.proof >= POW_TARGET:
+    while block.proof >= block.target:
         # TODO: accept interrupts here if tip changes
         if mining_interrupt.is_set():
             logger.info("Mining interrupted")
@@ -384,11 +460,15 @@ def mine_block(block):
 def mine_forever(public_key):
     logging.info("Starting miner")
     while True:
-        coinbase = prepare_coinbase(public_key)
+        block_subsidy = node.get_block_subsidy()
+        fees = node.calculate_fees(node.mempool)
+        coinbase = prepare_coinbase(public_key, block_subsidy + fees)
         unmined_block = Block(
             txns=[coinbase] + node.mempool,
             prev_id=node.blocks[-1].id,
             nonce=random.randint(0, 1000000000),
+            bits=node.get_next_bits(node.blocks[-1].id),
+            timestamp=time.time(),
         )
         mined_block = mine_block(unmined_block)
 
@@ -399,8 +479,10 @@ def mine_forever(public_key):
                 node.handle_block(mined_block)
 
 def mine_genesis_block(node, public_key):
-    coinbase = prepare_coinbase(public_key, tx_id="abc123")
-    unmined_block = Block(txns=[coinbase], prev_id=None, nonce=0)
+    coinbase = prepare_coinbase(public_key, 
+            node.get_block_subsidy(), tx_id="abc123")
+    unmined_block = Block(txns=[coinbase], prev_id=None, nonce=0,
+            bits=INITIAL_DIFFICULTY_BITS, timestamp=1546383741.5890396)
     mined_block = mine_block(unmined_block)
     node.blocks.append(mined_block)
     node.connect_tx(coinbase)
@@ -628,7 +710,7 @@ def main(args):
         utxos = response["data"]
 
         # Prepare transaction
-        tx = prepare_simple_tx(utxos, sender_private_key, recipient_public_key, amount)
+        tx = prepare_simple_tx(utxos, sender_private_key, recipient_public_key, amount, fee=100)
 
         # send to node
         send_message(address, "tx", tx)

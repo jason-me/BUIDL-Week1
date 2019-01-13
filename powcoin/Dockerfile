@@ -5,4 +5,5 @@ ADD mypowp2pcoin.py ./
 ADD utils.py ./
 ADD identities.py ./
 
+
 CMD ["python", "-u", "mypowp2pcoin.py", "serve"]
