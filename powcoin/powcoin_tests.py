@@ -58,9 +58,9 @@ def test_extend_chain():
     # Bob mines height=0,1
     p.mine_genesis_block(node, ids.bob_public_key)
     block = mine_block(node, ids.bob_public_key, node.blocks[0], [])
-    
+
     # Alice's balance unchanged, Bob received block subsidy
-    assert node.fetch_balance(ids.alice_public_key) == 0 
+    assert node.fetch_balance(ids.alice_public_key) == 0
     assert node.fetch_balance(ids.bob_public_key) == 2*p.BLOCK_SUBSIDY
 
     # Chain extended
@@ -81,7 +81,7 @@ def test_fork_chain():
     alice_block = mine_block(node, ids.alice_public_key, node.blocks[0], [])
 
     # UTXO database unchanged
-    assert node.fetch_balance(ids.alice_public_key) == 0 
+    assert node.fetch_balance(ids.alice_public_key) == 0
     assert node.fetch_balance(ids.bob_public_key) == 2*p.BLOCK_SUBSIDY
 
     # Chain unchanged
@@ -106,7 +106,7 @@ def test_block_extending_fork():
     alice_block = mine_block(node, ids.alice_public_key, node.branches[0][0], [])
 
     # UTXOs
-    assert node.fetch_balance(ids.alice_public_key) == 0 
+    assert node.fetch_balance(ids.alice_public_key) == 0
     assert node.fetch_balance(ids.bob_public_key) == 3*p.BLOCK_SUBSIDY
 
     # Now new branches
@@ -127,11 +127,11 @@ def test_block_forking_fork():
 
     # Alice mines 2 separate blocks top of her branch, each at height 2
     second = mine_block(node, ids.alice_public_key, node.branches[0][0], [])
-    third = mine_block(node, ids.alice_public_key, node.branches[0][0], [], 
+    third = mine_block(node, ids.alice_public_key, node.branches[0][0], [],
                        nonce=second.nonce+1)
-     
+
     # UTXOs and chain unaffected
-    assert node.fetch_balance(ids.alice_public_key) == 0 
+    assert node.fetch_balance(ids.alice_public_key) == 0
     assert node.fetch_balance(ids.bob_public_key) == 3*p.BLOCK_SUBSIDY
 
     # One more branch added, which contains alice's first block and this one
@@ -148,9 +148,9 @@ def test_successful_reorg():
     b0 = p.mine_genesis_block(node, ids.bob_public_key)
     b1 = mine_block(node, ids.bob_public_key, node.blocks[0], [])
     # height=2 contains a bob->alice txn
-    bob_to_alice = send_tx(node, ids.bob_private_key, 
+    bob_to_alice = send_tx(node, ids.bob_private_key,
                            ids.alice_public_key, 10)
-    b2 = mine_block(node, ids.bob_public_key, node.blocks[1], 
+    b2 = mine_block(node, ids.bob_public_key, node.blocks[1],
                     [bob_to_alice])
 
     # Alice accepts bob's first two blocks, but not the third
@@ -176,9 +176,9 @@ def test_successful_reorg():
     assert node.fetch_balance(ids.bob_public_key) == 3*p.BLOCK_SUBSIDY - 10
 
     # Use alice's node to assemble this txn b/c she doesn't have any utxos in bob's view of world
-    alice_to_bob = send_tx(alice_node, ids.alice_private_key, 
+    alice_to_bob = send_tx(alice_node, ids.alice_private_key,
                            ids.bob_public_key, 20)
-    a3 = mine_block(node, ids.alice_public_key, node.branches[0][0], 
+    a3 = mine_block(node, ids.alice_public_key, node.branches[0][0],
                     [alice_to_bob])
 
 
@@ -221,7 +221,7 @@ def test_unsuccessful_reorg():
     node.handle_block(a2)
 
     # Create one invalid block for Alice
-    alice_to_bob = send_tx(alice_node, ids.alice_private_key, 
+    alice_to_bob = send_tx(alice_node, ids.alice_private_key,
                            ids.bob_public_key, 20)
     # txn invalid b/c changing amount arbitrarily after signing ...
     alice_to_bob.tx_outs[0].amount = 100000
@@ -233,7 +233,7 @@ def test_unsuccessful_reorg():
     # This block shouldn't make it into branches or chain
     # b/c it contains an invalid transaction that will only be discovered
     # during reorg
-    a3 = mine_block(node, ids.alice_public_key, node.branches[0][0], 
+    a3 = mine_block(node, ids.alice_public_key, node.branches[0][0],
                     [alice_to_bob])
 
     # UTXO, chain, branches unchanged
