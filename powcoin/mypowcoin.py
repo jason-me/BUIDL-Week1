@@ -105,6 +105,7 @@ class Node:
 
     def __init__(self, address):
         self.blocks = []
+        self.branches = []
         self.utxo_set = {}
         self.mempool = []
         self.peers = []
@@ -130,7 +131,7 @@ class Node:
         return [tx_out for tx_out in self.utxo_set.values()
                 if tx_out.public_key == public_key]
 
-    def update_utxo_set(self, tx):
+    def connect_tx(self, tx):
         # Remove utxos that were just spent
         if not tx.is_coinbase:
             for tx_in in tx.tx_ins:
@@ -184,37 +185,54 @@ class Node:
             self.validate_tx(tx)
             self.mempool.append(tx)
 
-            # Propogate transaction
+            # Propagate transaction
             for peer in self.peers:
                 send_message(peer, "tx", tx)
 
-    def validate_block(self, block):
+    def validate_block(self, block, validate_txns=False):
         assert block.proof < POW_TARGET, "Insufficient Proof-of-Work"
-        assert block.prev_id == self.blocks[-1].id
+
+        if validate_txns:
+            # Validate coinbase separately
+            self.validate_coinbase(block.txns[0])
+
+            # Check the transactions are valid
+            for tx in block.txns[1:]:
+                self.validate_tx(tx)
 
     def handle_block(self, block):
-        # Check work, chain ordering
-        self.validate_block(block)
+        # Conditions
+        extends_chain = block.prev_id == self.blocks[-1].id
+        forks_chain = not extends_chain and \
+                block.prev_id in [block.id for block in self.blocks]
 
-        # Validate coinbase separately
-        self.validate_coinbase(block.txns[0])
+        # Always validate, but only validate transactions if extending chain
+        self.validate_block(block, validate_txns=extends_chain)
 
-        # Check the transactions are valid
-        for tx in block.txns[1:]:
-            self.validate_tx(tx)
-
-        # If they're all good, update self.blocks and self.utxo_set
-        for tx in block.txns:
-            self.update_utxo_set(tx)
-
-        # Add the block to our chain
-        self.blocks.append(block)
+        # Handle each condition separately
+        if extends_chain:
+            self.connect_block(block)
+            logger.info(f"Extended chain to height {len(self.blocks)-1}")
+        elif forks_chain:
+           self.branches.append([block])
+           logger.info(f"Created branch {len(self.branches)-1}")
+        else:
+           raise Exception("Couldn't locate parent block")
 
         logger.info(f"Block accepted: height={len(self.blocks) - 1}")
 
         # Block propogation
         for peer in self.peers:
             disrupt(func=send_message, args=[peer, "blocks", [block]])
+
+    def connect_block(self, block):
+        # Add the block to our chain
+        self.blocks.append(block)
+
+        # If they're all good, update UTXO set / mempool
+        for tx in block.txns:
+            self.connect_tx(tx)
+
 
 def prepare_simple_tx(utxos, sender_private_key, recipient_public_key, amount):
     sender_public_key = sender_private_key.get_verifying_key()
@@ -297,13 +315,13 @@ def mine_forever(public_key):
             with lock:
                 node.handle_block(mined_block)
 
-def mine_genesis_block(public_key):
-    global node
+def mine_genesis_block(node, public_key):
     coinbase = prepare_coinbase(public_key, tx_id="abc123")
     unmined_block = Block(txns=[coinbase], prev_id=None, nonce=0)
     mined_block = mine_block(unmined_block)
     node.blocks.append(mined_block)
-    node.update_utxo_set(coinbase)
+    node.connect_tx(coinbase)
+    return mined_block
 
 ##############
 # Networking #
@@ -479,7 +497,7 @@ def main(args):
         node = Node(address=(name, PORT))
 
         # Alice is Satoshi!
-        mine_genesis_block(lookup_public_key("alice"))
+        mine_genesis_block(node, lookup_public_key("alice"))
 
         # Start server thread
         server_thread = threading.Thread(target=serve, name="server")
