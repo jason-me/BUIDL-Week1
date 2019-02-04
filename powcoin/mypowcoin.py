@@ -274,8 +274,11 @@ class Node:
             if total_work(branch) > total_work(chain_since_fork):
                 logger.info(f"Reorging to branch {branch_index}")
                 self.reorg(branch, branch_index)
+
+            logger.info(f"Extended branch {branch_index} to height {len(branch)-1}")
+
         elif forks_branch:
-            self.branches.append(branch[height+1] + [block])
+            self.branches.append(branch[:height+1] + [block])
             logger.info(f"Created branch {len(self.branches)-1} to height {len(self.branches[-1]) - 1}")
         else:
             self.sync()
