@@ -18,17 +18,19 @@ from docopt import docopt
 from copy import deepcopy
 from ecdsa import SigningKey, SECP256k1
 
+PORT = 10000
 node = None
 lock = threading.Lock()
 mining_interrupt = threading.Event()
 
-PORT = 10000
-GET_BLOCKS_CHUNK = 10
-DIFFICULTY_BITS = 15
-POW_TARGET = 2 ** (256 - DIFFICULTY_BITS)
-HALVENING_INTERVAL = 60 * 24
 SATOSHIS_PER_COIN = 100_000_000
+GET_BLOCKS_CHUNK = 10
+HALVENING_INTERVAL = 60 * 24
 
+INITIAL_DIFFICULTY_BITS = 17
+BLOCK_TIME_IN_SECS = 1
+BLOCKS_PER_DIFFICULTY_PERIOD = 5
+DIFFICULTY_PERIOD_IN_SECS = BLOCK_TIME_IN_SECS * BLOCKS_PER_DIFFICULTY_PERIOD
 
 logging.basicConfig(level="INFO", format='%(threadName)-6s | %(message)s')
 logger = logging.getLogger(__name__)
@@ -39,7 +41,7 @@ def spend_message(tx, index):
     return serialize(outpoint) + serialize(tx.tx_outs)
 
 def total_work(blocks):
-    return len(blocks)
+    return sum([2**block.bits for block in blocks])
 
 def tx_in_to_tx_out(tx_in, blocks):
     for block in blocks:
@@ -96,10 +98,12 @@ class TxOut:
 
 class Block:
 
-    def __init__(self, txns, prev_id, nonce):
+    def __init__(self, txns, prev_id, nonce, bits, timestamp):
         self.txns = txns
         self.prev_id = prev_id
         self.nonce = nonce
+        self.bits = bits
+        self.timestamp =  timestamp
 
     @property
     def header(self):
@@ -112,6 +116,10 @@ class Block:
     @property
     def proof(self):
         return int(self.id, 16)
+
+    @property
+    def target(self):
+        return 2 ** (256 - self.bits)
 
     def __eq__(self, other):
         return self.id == other.id
@@ -227,9 +235,20 @@ class Node:
                 send_message(peer, "tx", tx)
 
     def validate_block(self, block, validate_txns=False):
-        assert block.proof < POW_TARGET, "Insufficient Proof-of-Work"
+        assert block.proof < block.target, "Insufficient Proof-of-Work"
 
         if validate_txns:
+            # Check block timestamps are not too far in future
+            assert block.timestamp - time.time() < DIFFICULTY_PERIOD_IN_SECS,\
+                    "Block too far in future"
+
+            # Block timestamps must advance every block period
+            height = max(len(self.blocks) - BLOCKS_PER_DIFFICULTY_PERIOD, 0)
+            assert block.timestamp > self.blocks[height].timestamp,\
+                    "Block periods cannot go back in time"
+
+            # Check difficulty adjustment
+            assert block.bits == self.get_next_bits(block.prev_id, log=True)
 
             # Validate coinbase separately
             self.validate_coinbase(block)
@@ -340,6 +359,47 @@ class Node:
             fees += inputs - outputs
         return fees
 
+    def get_next_bits(self, block_id, log=False):
+        # Find the block
+        height = [block.id for block in self.blocks].index(block_id)
+        block = self.blocks[height]
+
+        #Will we enter a new difficulty period?
+        next_height = height + 1
+        next_block_period = next_height // BLOCKS_PER_DIFFICULTY_PERIOD
+        next_block_period_height = next_height % BLOCKS_PER_DIFFICULTY_PERIOD
+
+        #Only change bits if were entering a new difficulty period
+        if next_block_period_height != 0:
+            return block.bits
+
+        #Calculate how long the diff period lasted
+        one_period_ago_index = max(
+            height - BLOCKS_PER_DIFFICULTY_PERIOD, 0)
+        one_period_ago_block = self.blocks[one_period_ago_index]
+        period_duration = block.timestamp - one_period_ago_block.timestamp
+
+
+
+        #Calculate next bits
+        if period_duration <= DIFFICULTY_PERIOD_IN_SECS:
+            next_bits = block.bits + 1
+        else:
+            next_bits = block.bits - 1
+
+        #Log some information
+        if log:
+            logger.info(
+                "(difficulty adjustment) "
+                f"period={next_block_period }"
+                f"target={DIFFICULTY_PERIOD_IN_SECS }"
+                f"duration={period_duration }"
+                f"bits={block.bits}-->{next_bits }"
+            )
+
+        return next_bits
+
+
 def prepare_simple_tx(utxos, sender_private_key, recipient_public_key, amount, fee):
     sender_public_key = sender_private_key.get_verifying_key()
 
@@ -390,7 +450,7 @@ def prepare_coinbase(public_key, block_subsidy, tx_id=None):
 
 
 def mine_block(block):
-    while block.proof >= POW_TARGET:
+    while block.proof >= block.target:
         # TODO: accept interrupts here if tip changes
         if mining_interrupt.is_set():
             logger.info("Mining interrupted")
@@ -410,6 +470,8 @@ def mine_forever(public_key):
             txns=[coinbase] + node.mempool,
             prev_id=node.blocks[-1].id,
             nonce=random.randint(0, 1000000000),
+            bits=node.get_next_bits(node.blocks[-1].id),
+            timestamp=time.time(),
         )
         mined_block = mine_block(unmined_block)
 
@@ -422,7 +484,8 @@ def mine_forever(public_key):
 def mine_genesis_block(node, public_key):
     coinbase = prepare_coinbase(public_key,
             node.get_block_subsidy(), tx_id="abc123")
-    unmined_block = Block(txns=[coinbase], prev_id=None, nonce=0)
+    unmined_block = Block(txns=[coinbase], prev_id=None, nonce=0,
+            bits=INITIAL_DIFFICULTY_BITS, timestamp=1568497065.7367418)
     mined_block = mine_block(unmined_block)
     node.blocks.append(mined_block)
     node.connect_tx(coinbase)
